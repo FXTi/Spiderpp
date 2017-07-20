@@ -10,7 +10,7 @@
 #include <cassert>
 #define TASKER_ACTIVE 1
 #define TASKER_IDLE 0
-#define DEBUG
+#define NOTDEBUG
 
 class Log{
 //Serve as the log function
@@ -30,7 +30,8 @@ void Log::operator()(const std::string &s, const logstate state = normal) const 
 	std::strftime(now,25,"[%F %T]",std::localtime(&result));
 	switch(state){
 		case normal: std::cout << now << s << std::endl; break;
-		default: break;
+		case error: std::cout << now << "\033[1;31mError: \033[0m" << s << std::endl; break;
+		case warning: std::cout << now << "\033[1;34mWarning: \033[0m" << s << std::endl; break;
 	}
 }
 
@@ -38,49 +39,95 @@ void Log::operator()(const std::string &s, const logstate state = normal) const 
 static Log log;
 
 class TaskQueue{
-//Serve as the TaskQueue to store the urls, containing essential webpage or resources needed to be downloaded later
-//FIFO container
-//When size() return 0 or pop() return empty string, TaskQueue is empty
+//Serve as the Url waiting list
+//Act as a deque, with the ability to eliminate the same url in it
 
 public:
-	TaskQueue() = default;
+	TaskQueue(): curr(0) {}
 	~TaskQueue() = default;
 	//As the unique TaskQueue, it should have any duplicate
 	TaskQueue(const TaskQueue&) = delete;
 	TaskQueue& operator=(const TaskQueue&) = delete;
-	constexpr size_t size() const { return queue.size(); }
-	void push(const std::string &s) { queue.push_back(s); };
-	std::string pop() { if(queue.empty()) return std::string();
-		std::string tmp(queue.front()); 
-		queue.pop_front(); return tmp; };
+	size_t size() { std::lock_guard<std::mutex> g(lock); return urllist.size() - curr; }
+	void push(const std::string &s) { std::lock_guard<std::mutex> g(lock); if(!has(s)) urllist.push_back(s); };
+	//pop() has two return call, so two unlock call are needed
+	std::string pop() { std::lock_guard<std::mutex> g(lock);
+		if(curr == urllist.size()) { return std::string(); }
+		return urllist[curr++]; };
 private:
-	std::deque<std::string> queue;
+	constexpr bool has(const std::string &s) const 
+		{ for(auto &c: urllist) if(c == s) return true; return false; }
+	std::vector<std::string> urllist;
+	std::mutex lock;
+	size_t curr;
 };
 
 //Initialize Taskqueue
 static TaskQueue taskqueue;
 
-class Storage{
-//Serve as a Register Table
-//Using Hash Table to maintain the stroed file infomatin(MD5)
-//Regardless the actual file-store-to-disk process
-
+class Tasker {
 public:
-	Storage() = default;
-	~Storage() = default;
-	//As the unique Storage, it should have any duplicate
-	Storage(const Storage&) = delete;
-	Storage& operator=(const Storage&) = delete;
-	constexpr size_t size() const { return files.size(); }
-	void store(const std::string &file) { files.insert(file); }
-	bool have(const std::string &s) const { 
-		return (files.find(s) == files.cend())? false: true; };
-private:
-	std::set<std::string> files;
+	Tasker() = default;
+	~Tasker() = default;
+	void operator()(const unsigned) const;
+	std::string download(const std::string &s) const { return std::string(s); }
+	//Include the saving process
+	void pmatch(const std::string &s) const { std::cout << s << std::endl; }
 };
 
-//Initialize Storage
-static Storage storage;
+//Initialize Tasker
+static Tasker tasker;
+
+class TaskerPool {
+//Construct function accordig to thread creating process
+	friend class Tasker;
+	friend void debug();
+public:
+	TaskerPool() = default;
+	~TaskerPool() = default;
+	//As the unique TaskerPool, it should have any duplicate
+	TaskerPool(TaskerPool&) = delete;
+	TaskerPool &operator=(const TaskerPool&) = delete;
+	//Return number of running threads
+	constexpr unsigned count() const { int sum = 0;
+		for(auto &i: flags) {sum += i;} return sum; }
+	void run(const unsigned);
+private:
+	std::vector<std::thread> taskers;
+	//1 for ACTIVE, 0 for IDLE
+	//For the convenience of statics
+	//std::vector<std::atomic<unsigned short>> flags;
+	std::vector<unsigned short> flags;
+};
+
+void TaskerPool::run(const unsigned thr_cnt) {
+	//Creating...
+	for(unsigned index = 0; index != thr_cnt; ++index){
+		taskers.push_back(std::thread(tasker,index));
+		flags.push_back(TASKER_ACTIVE);
+	}
+
+	for(auto &thread: taskers)
+		thread.join();
+}
+
+//Initialize TaskerPool
+static TaskerPool taskerpool;
+
+void Tasker::operator()(const unsigned id) const {
+	std::string url;
+	while(!(taskqueue.size() == 0 && taskerpool.count() == 0)){ 
+		if((url = taskqueue.pop()) == std::string()){
+			taskerpool.flags[id] = TASKER_IDLE;
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		} else {
+			taskerpool.flags[id] = TASKER_ACTIVE;
+			std::string  page = download(url);
+			pmatch(page);
+		}
+	}
+	
+}
 
 class Scheduler {
 //Designed to control the Tasker, handle the error, interact with user, and manage scale
@@ -92,63 +139,11 @@ public:
 	//As the unique Scheduler, it should have any duplicate
 	Scheduler(const Scheduler&) = delete;
 	Scheduler& operator=(const Scheduler&) = delete;
-	void run(const unsigned) const;
+	void run(const std::string &s, const unsigned thr_cnt) const 
+	{ taskqueue.push(s); taskerpool.run(thr_cnt); }
 };
 
-class Tasker {
-	friend void Scheduler::run(const unsigned) const;
-public:
-	void operator()(const unsigned) const;
-};
-
-void Tasker::operator()(const unsigned id) const {
-	//Wait
-	//while(!(taskerpool.count() == 0 && taskqueue.size() == 0)){ /*Do nothing*/ }
-	std::cout << id << std::endl;
-}
-
-//Initialize Tasker
-static Tasker tasker;
-
-class TaskerPool {
-//Construct function accordig to thread creating process
-	friend class Tasker;
-	friend void debug();
-	friend void Scheduler::run(const unsigned) const;
-public:
-	TaskerPool() = default;
-	~TaskerPool() = default;
-	//As the unique Scheduler, it should have any duplicate
-	TaskerPool(TaskerPool&) = delete;
-	TaskerPool &operator=(const TaskerPool&) = delete;
-	//Return number of running threads
-	unsigned count() const { int sum = 0;
-		for(auto &i: flags) {sum += i;} return sum; }
-private:
-	std::vector<std::thread> taskers;
-	//1 for ACTIVE, 0 for IDLE
-	//For the convenience of statics
-	std::vector<unsigned short> flags;
-};
-
-//Initialize Scheduler
-static TaskerPool taskerpool;
-
-void Scheduler::run(const unsigned thr_cnt) const {
-	//Creating...
-	for(unsigned index = 0; index != thr_cnt; ++index){
-		taskerpool.taskers.push_back(std::thread(tasker,index));
-		taskerpool.flags.push_back(TASKER_ACTIVE);
-	}
-
-	for(auto &thread: taskerpool.taskers)
-		thread.join();
-}
-
-//Initialize Scheduler
-static Scheduler scheduler;
-
-#ifdef DEBUG
+#ifndef NOTDEBUG
 void debug(){
 	//TaskQueue
 	log("Test the TaskQueue");
@@ -162,40 +157,36 @@ void debug(){
 	assert(taskqueue.size() == 0);
 	assert(taskqueue.pop() == std::string());
 	assert(taskqueue.size() == 0);
+	taskqueue.push("test1");
+	taskqueue.push("test2");
+	assert(taskqueue.size() == 0);
 	log("TaskQueue pass");
-
-	//Storage
-	log("Test the Storage");
-	assert(storage.size() == 0);
-	storage.store("test.txt");
-	assert(storage.have("test.txt"));
-	storage.store("test2.txt");
-	assert(storage.have("test2.txt"));
-	assert(storage.have("test.txt"));
-	storage.store("test2.txt");
-	assert(storage.size() == 2);
-	log("Storage pass");
 
 	//TaskerPool and Scheduler
 	log("Test TaskerPool and Scheduler");
 	TaskerPool taskertest;
 	for(unsigned index = 0; index != 4; ++index){
-		taskertest.taskers.push_back(std::thread([]
-					{std::this_thread::sleep_for(std::chrono::milliseconds(1000));}));
+		taskertest.taskers.push_back(std::thread([&taskertest](const unsigned i)
+					{std::this_thread::sleep_for(std::chrono::milliseconds(500));
+					taskertest.flags[i] = TASKER_IDLE;},index));
 		taskertest.flags.push_back(TASKER_ACTIVE);
 	}
 	assert(taskertest.count() == 4);
 	for(auto &thread: taskertest.taskers)
 		thread.join();
+	assert(taskertest.count() == 0);
 	log("TaskerPool and Scheduler pass");
 }
 #endif
 
 int main(int argc,char *argv[]){
-	//Start scheduler
-	scheduler.run(4);
+	//Initialize Scheduler
+	Scheduler scheduler;
 
-#ifdef DEBUG
+	//Start scheduler
+	scheduler.run("www.baidu.com",4);
+
+#ifndef NOTDEBUG
 	debug();
 #endif
 
