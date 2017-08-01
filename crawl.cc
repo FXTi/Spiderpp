@@ -1,6 +1,7 @@
 #include <iostream>
+#include <fstream>
+#include <regex>
 #include <chrono>
-#include <atomic>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -8,6 +9,7 @@
 #include <set>
 #include <deque>
 #include <cassert>
+#include <cpr/cpr.h>
 #define TASKER_ACTIVE 1
 #define TASKER_IDLE 0
 #define NOTDEBUG
@@ -53,7 +55,7 @@ public:
 	//pop() has two return call, so two unlock call are needed
 	std::string pop() { std::lock_guard<std::mutex> g(lock);
 		if(curr == urllist.size()) { return std::string(); }
-		return urllist[curr++]; };
+		return urllist[curr++]; }
 private:
 	constexpr bool has(const std::string &s) const 
 		{ for(auto &c: urllist) if(c == s) return true; return false; }
@@ -70,9 +72,21 @@ public:
 	Tasker() = default;
 	~Tasker() = default;
 	void operator()(const unsigned) const;
-	std::string download(const std::string &s) const { return std::string(s); }
+	void download(const std::string &s, cpr::Response &resp) const 
+		{ resp = cpr::Get(s); std::string status = std::to_string(resp.status_code);
+	       log(status+" "+resp.url);}
 	//Include the saving process
-	void pmatch(const std::string &s) const { std::cout << s << std::endl; }
+	void pmatch(cpr::Response &resp) const {
+		if(resp.header["content-type"] == "image/png"){
+			std::fstream imgout(resp.url.substr(resp.url.find_last_of("/")+1) + ".png", std::ios::out | std::ios::binary);
+				imgout.write(resp.text.data(), resp.text.length()); imgout.close(); }
+		if(resp.header["content-type"] == "image/jpeg"){
+			std::fstream imgout(resp.url.substr(resp.url.find_last_of("/")+1) + ".jpg", std::ios::out | std::ios::binary);
+				imgout.write(resp.text.data(), resp.text.length()); imgout.close(); }
+		if(resp.header["content-type"] == "text/html; charset=utf-8"){
+			std::string pattern("https://pic[[:digit:]].zhimg.com/[[:alnum:]]*");
+			std::regex r(pattern,std::regex_constants::grep);
+			for (std::sregex_iterator it(resp.text.begin(), resp.text.end(), r), end; it != end; ++it)  taskqueue.push(it->str()) ; } }
 };
 
 //Initialize Tasker
@@ -122,8 +136,9 @@ void Tasker::operator()(const unsigned id) const {
 			std::this_thread::sleep_for(std::chrono::milliseconds(100));
 		} else {
 			taskerpool.flags[id] = TASKER_ACTIVE;
-			std::string  page = download(url);
-			pmatch(page);
+			cpr::Response resp;
+			download(url,resp);
+			pmatch(resp);
 		}
 	}
 	
@@ -184,7 +199,7 @@ int main(int argc,char *argv[]){
 	Scheduler scheduler;
 
 	//Start scheduler
-	scheduler.run("www.baidu.com",4);
+	scheduler.run("https://www.zhihu.com/question/28116784",4);
 
 #ifndef NOTDEBUG
 	debug();
